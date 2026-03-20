@@ -16,6 +16,7 @@
   - `MagicBB_Sub = MagicNumber + MagicSubOffset + 1`
 
 ---
+---
 
 ## 3) Kích hoạt Sub
 Sub được kích hoạt khi:
@@ -96,11 +97,8 @@ Các hàm Sub riêng:
 - `VirtualPendingEntry.basePriceAtAdd` giúp pending của mỗi engine bám đúng base đã tạo.
 
 ### 4.8 Vẽ chart
-- Base Main: đường chấm **vàng**
-- Base Sub: đường chấm **trắng**
-- Vùng mở lệnh:
-  - Main: vùng mờ **trắng**
-  - Sub: vùng mờ **vàng**
+- Tắt hoàn toàn để chạy nhẹ.
+- EA không còn cập nhật hiển thị `base lines` và `open-zone rectangles` trong luồng `OnTick`.
 
 ---
 
