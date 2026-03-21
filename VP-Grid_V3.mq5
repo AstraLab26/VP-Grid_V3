@@ -238,12 +238,18 @@ double sessionClosedProfitRemainingSub = 0.0;  // Sub: pool remaining in tick.
 datetime lastResetTime = 0;                     // Last reset time (avoid double-count from orders just closed on reset)
 datetime lastResetTimeSub = 0;                // Sub: last reset time (avoid double-count)
 bool subActive = false;                       // Sub: whether sub engine is active (baseSub initialized)
+// Zones (mờ): when price enters/leaves base band
+bool mainZoneActive = false;
+datetime mainZoneStart = 0;
+bool subZoneActive = false;
+datetime subZoneStart = 0;
 bool eaStoppedByTarget = false;                 // true = EA stopped placing new orders (Stop mode)
 double balanceGoc = 0.0;                       // Base capital for scaling (BaseCapitalUSD or balance at attach)
 double attachBalance = 0.0;                    // Balance when EA first attached: never reset. For "Initial balance at EA startup" and "Change vs initial"
 double sessionMultiplier = 1.0;                // Lot and TP multiplier by % growth vs balanceGoc (1.0 = no change)
 double sessionPeakProfit = 0.0;                // Session profit peak (for trailing profit lock)
 double sessionPeakProfitSub = 0.0;            // Sub: session peak profit
+double sessionMultiplierSub = 1.0;           // Sub: separate scaling multiplier
 bool gongLaiMode = false;                      // true = trailing threshold reached, pendings cancelled, only trail SL on open positions
 bool gongLaiModeSub = false;                  // Sub: trailing threshold reached
 bool trailingSLPlaced = false;                // SL already placed (at point A or trailed). Return mode only allowed when SL not yet placed.
@@ -253,6 +259,7 @@ double lastSellTrailPrice = 0.0;               // Last price when SL Sell was up
 double lastBuyTrailPriceSub = 0.0;           // Sub: last buy trail price
 double lastSellTrailPriceSub = 0.0;          // Sub: last sell trail price
 double pointABaseLevel = 0.0;                 // Grid level chosen for point A (was used for yellow line draw)
+double pointABaseLevelSub = 0.0;              // Sub: grid level chosen for point A
 double trailingGocBuy = 0.0;                 // Buy base fixed at trailing threshold (grid level below price, closest)
 double trailingGocSell = 0.0;                // Sell base fixed at threshold (grid level above price, closest)
 double trailingGocBuySub = 0.0;              // Sub: buy base fixed at trailing threshold
@@ -309,12 +316,19 @@ int MagicBB_Sub = 0;                          // Sub-BB orders magic
 datetime lastBalanceBBCloseTime = 0;          // Last time we closed losing BB (for cooldown)
 datetime lastBalanceCCCloseTime = 0;          // Last time we closed losing CC (for cooldown)
 datetime lastBalanceAAByBBCloseTime = 0;     // Last time we closed AA by BB balance (for cooldown)
+datetime lastBalanceBBCloseTimeSub = 0;       // Sub: Last time we closed losing BB (for cooldown)
+datetime lastBalanceAAByBBCloseTimeSub = 0;    // Sub: Last time we closed AA by BB balance (for cooldown)
 ulong balancePreparedTicket = 0;             // Ticket selected for balance (farthest opposite); cleared if price returns to base
 int balancePrepareDirection = 0;             // 0=none, +1=price above base (prepare Sells below), -1=price below base (prepare Buys above)
 double balanceSelectedLevelPrice = 0.0;      // Remember: selected grid level price for balancing (only close orders at this level)
 ulong balanceSelectedTickets[];              // Mark: list of selected tickets for balance preparation (one farthest level)
+ulong balancePreparedTicketSub = 0;          // Sub: selected ticket for balance
+int balancePrepareDirectionSub = 0;          // Sub: 0=none, +1=price above baseSub, -1=price below baseSub
+double balanceSelectedLevelPriceSub = 0.0;   // Sub: selected level price for balancing
+ulong balanceSelectedTicketsSub[];           // Sub: selected ticket list at one farthest level
 // Locked profit cumulative across sessions, never reset. This $ lock not used for balance (pool = TP in session - lock in session).
-double lockedProfitReserve = 0.0;            // Locked profit (X% of each profitable TP close); cumulative; not used for balance pool
+double lockedProfitReserveMain = 0.0;       // Main: Locked profit reserve (cumulative), used as "balance floor" for balance actions
+double lockedProfitReserveSub = 0.0;        // Sub: Locked profit reserve (cumulative), used as "balance floor" for balance actions
 
 //--- Virtual pending: do not place broker pending orders; when price touches level -> Market + TP
 struct VirtualPendingEntry
@@ -358,6 +372,193 @@ bool IsSubMagic(long magic)
 //+------------------------------------------------------------------+
 void SwapDouble(double &a, double &b) { double t = a; a = b; b = t; }
 void SwapULong(ulong &a, ulong &b) { ulong t = a; a = b; b = t; }
+
+//+------------------------------------------------------------------+
+//| Draw base lines (main: yellow dotted, sub: white dotted)       |
+//+------------------------------------------------------------------+
+void DrawBaseLines()
+{
+   // Main base
+   string nameMain = "VPGRID_BASE_MAIN";
+   if(ObjectFind(0, nameMain) < 0)
+      ObjectCreate(0, nameMain, OBJ_HLINE, 0, 0, basePrice);
+   ObjectSetDouble(0, nameMain, OBJPROP_PRICE, basePrice);
+   ObjectSetInteger(0, nameMain, OBJPROP_COLOR, clrYellow);
+   ObjectSetInteger(0, nameMain, OBJPROP_STYLE, STYLE_DOT);
+   ObjectSetInteger(0, nameMain, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, nameMain, OBJPROP_BACK, true);
+
+   // Sub base
+   string nameSub = "VPGRID_BASE_SUB";
+   if(EnableSub && subActive)
+   {
+      if(ObjectFind(0, nameSub) < 0)
+         ObjectCreate(0, nameSub, OBJ_HLINE, 0, 0, basePriceSub);
+      ObjectSetDouble(0, nameSub, OBJPROP_PRICE, basePriceSub);
+      ObjectSetInteger(0, nameSub, OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(0, nameSub, OBJPROP_STYLE, STYLE_DOT);
+      ObjectSetInteger(0, nameSub, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, nameSub, OBJPROP_BACK, true);
+   }
+   else
+   {
+      if(ObjectFind(0, nameSub) >= 0)
+         ObjectDelete(0, nameSub);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Semi-transparent color helper                                    |
+//+------------------------------------------------------------------+
+color ColorWithAlpha(color baseColor, uchar alpha)
+{
+   // ARGB: (alpha<<24) | (RGB)
+   uint rgb = (uint)baseColor & 0x00FFFFFF;
+   uint argb = (uint(alpha) << 24) | rgb;
+   return (color)argb;
+}
+
+//+------------------------------------------------------------------+
+//| Draw open-zone rectangles when price enters/leaves base band |
+//+------------------------------------------------------------------+
+void UpdateOpenZones()
+{
+   if(gridStep <= 0.0)
+      return;
+   datetime now = TimeCurrent();
+   double time1Main = (mainZoneStart > 0 ? (double)mainZoneStart : (double)(now - 3600));
+   double time1Sub  = (subZoneStart > 0 ? (double)subZoneStart : (double)(now - 3600));
+
+   // Compute farthest open prices for MAIN (magic main) and SUB (magic sub)
+   bool hasMainUp = false, hasMainDn = false;
+   double mainUpPrice = 0.0, mainDnPrice = 0.0;
+   bool hasSubUp = false, hasSubDn = false;
+   double subUpPrice = 0.0, subDnPrice = 0.0;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      long mag = PositionGetInteger(POSITION_MAGIC);
+      double op = PositionGetDouble(POSITION_PRICE_OPEN);
+      datetime pt = (datetime)PositionGetInteger(POSITION_TIME);
+
+      // MAIN: only current main session
+      if(mag == MagicAA || mag == MagicBB || mag == MagicCC || mag == MagicDD)
+      {
+         if(sessionStartTime > 0 && pt < sessionStartTime) continue;
+         if(op > basePrice)
+         {
+            if(!hasMainUp || op > mainUpPrice) { hasMainUp = true; mainUpPrice = op; }
+         }
+         else if(op < basePrice)
+         {
+            if(!hasMainDn || op < mainDnPrice) { hasMainDn = true; mainDnPrice = op; }
+         }
+      }
+
+      // SUB: only current sub session
+      if(mag == MagicAA_Sub || mag == MagicBB_Sub)
+      {
+         if(sessionStartTimeSub > 0 && pt < sessionStartTimeSub) continue;
+         if(op > basePriceSub)
+         {
+            if(!hasSubUp || op > subUpPrice) { hasSubUp = true; subUpPrice = op; }
+         }
+         else if(op < basePriceSub)
+         {
+            if(!hasSubDn || op < subDnPrice) { hasSubDn = true; subDnPrice = op; }
+         }
+      }
+   }
+
+   // Draw MAIN up-zone: between basePrice and farthest open above base
+   string rMainUp = "VPGRID_ZONE_MAIN_UP";
+   string rMainDn = "VPGRID_ZONE_MAIN_DN";
+   if(hasMainUp)
+   {
+      double p1 = MathMin(basePrice, mainUpPrice);
+      double p2 = MathMax(basePrice, mainUpPrice);
+      if(ObjectFind(0, rMainUp) >= 0) ObjectDelete(0, rMainUp);
+      ObjectCreate(0, rMainUp, OBJ_RECTANGLE, 0, (datetime)time1Main, p1, now, p2);
+      ObjectSetInteger(0, rMainUp, OBJPROP_BACK, true);
+      ObjectSetInteger(0, rMainUp, OBJPROP_COLOR, ColorWithAlpha(clrWhite, 70));
+      ObjectSetInteger(0, rMainUp, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, rMainUp, OBJPROP_WIDTH, 1);
+      mainZoneActive = true;
+   }
+   else if(ObjectFind(0, rMainUp) >= 0)
+   {
+      ObjectDelete(0, rMainUp);
+   }
+
+   // Draw MAIN dn-zone: between farthest open below base and basePrice
+   if(hasMainDn)
+   {
+      double p1 = MathMin(basePrice, mainDnPrice);
+      double p2 = MathMax(basePrice, mainDnPrice);
+      if(ObjectFind(0, rMainDn) >= 0) ObjectDelete(0, rMainDn);
+      ObjectCreate(0, rMainDn, OBJ_RECTANGLE, 0, (datetime)time1Main, p1, now, p2);
+      ObjectSetInteger(0, rMainDn, OBJPROP_BACK, true);
+      ObjectSetInteger(0, rMainDn, OBJPROP_COLOR, ColorWithAlpha(clrWhite, 70));
+      ObjectSetInteger(0, rMainDn, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, rMainDn, OBJPROP_WIDTH, 1);
+      mainZoneActive = true;
+   }
+   else if(ObjectFind(0, rMainDn) >= 0)
+   {
+      ObjectDelete(0, rMainDn);
+   }
+
+   if(!hasMainUp && !hasMainDn)
+      mainZoneActive = false;
+
+   // Draw SUB zones (only when sub engine active)
+   string rSubUp = "VPGRID_ZONE_SUB_UP";
+   string rSubDn = "VPGRID_ZONE_SUB_DN";
+   if(EnableSub && subActive)
+   {
+      if(hasSubUp)
+      {
+         double p1 = MathMin(basePriceSub, subUpPrice);
+         double p2 = MathMax(basePriceSub, subUpPrice);
+         if(ObjectFind(0, rSubUp) >= 0) ObjectDelete(0, rSubUp);
+         ObjectCreate(0, rSubUp, OBJ_RECTANGLE, 0, (datetime)time1Sub, p1, now, p2);
+         ObjectSetInteger(0, rSubUp, OBJPROP_BACK, true);
+         ObjectSetInteger(0, rSubUp, OBJPROP_COLOR, ColorWithAlpha(clrYellow, 70));
+         ObjectSetInteger(0, rSubUp, OBJPROP_STYLE, STYLE_SOLID);
+         ObjectSetInteger(0, rSubUp, OBJPROP_WIDTH, 1);
+         subZoneActive = true;
+      }
+      else if(ObjectFind(0, rSubUp) >= 0)
+         ObjectDelete(0, rSubUp);
+
+      if(hasSubDn)
+      {
+         double p1 = MathMin(basePriceSub, subDnPrice);
+         double p2 = MathMax(basePriceSub, subDnPrice);
+         if(ObjectFind(0, rSubDn) >= 0) ObjectDelete(0, rSubDn);
+         ObjectCreate(0, rSubDn, OBJ_RECTANGLE, 0, (datetime)time1Sub, p1, now, p2);
+         ObjectSetInteger(0, rSubDn, OBJPROP_BACK, true);
+         ObjectSetInteger(0, rSubDn, OBJPROP_COLOR, ColorWithAlpha(clrYellow, 70));
+         ObjectSetInteger(0, rSubDn, OBJPROP_STYLE, STYLE_SOLID);
+         ObjectSetInteger(0, rSubDn, OBJPROP_WIDTH, 1);
+         subZoneActive = true;
+      }
+      else if(ObjectFind(0, rSubDn) >= 0)
+         ObjectDelete(0, rSubDn);
+
+      if(!hasSubUp && !hasSubDn)
+         subZoneActive = false;
+   }
+   else
+   {
+      if(ObjectFind(0, rSubUp) >= 0) ObjectDelete(0, rSubUp);
+      if(ObjectFind(0, rSubDn) >= 0) ObjectDelete(0, rSubDn);
+      subZoneActive = false;
+   }
+}
 
 //+------------------------------------------------------------------+
 //| Date key helpers (server time)                                    |
@@ -800,7 +1001,7 @@ bool BalanceOpenAcrossBaseNoTP(double xUSD)
    double posVol = posVols[0];
    double negVol = negVols[0];
 
-   double balanceFloor = sessionStartBalance + lockedProfitReserve;
+   double balanceFloor = sessionStartBalance + lockedProfitReserveMain;
    double balanceNow = AccountInfoDouble(ACCOUNT_BALANCE);
    bool anyClosed = false;
    bool posClosed = false;
@@ -883,6 +1084,256 @@ bool BalanceOpenAcrossBaseNoTP(double xUSD)
    return anyClosed;
 }
 
+// Sub: balance open opposite-side losing positions (no TP) based on separate sub pool.
+bool BalanceOpenAcrossBaseNoTP_Sub(double xUSD)
+{
+   if(!EnableBalanceOpenAcrossBaseNoTP)
+      return false;
+   if(xUSD <= 0.0)
+      return false;
+   if(sessionClosedProfitRemainingSub < 0)
+      return false;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool priceAboveBase = (bid > basePriceSub);
+   bool priceBelowBase = (bid < basePriceSub);
+   if(!priceAboveBase && !priceBelowBase)
+      return false;
+
+   // RSI balance filter (independent of base, uses priceAboveBase flag)
+   if((priceAboveBase || priceBelowBase) && !IsRSIBalanceAllowed(priceAboveBase))
+      return false;
+
+   // Distance condition: current price must be at least N grid steps away from base.
+   if(gridStep <= 0)
+      return false;
+   double minDistPrice = gridStep * (double)MathMax(1, BalanceOpenAcrossBaseNoTP_MinDistanceLevels);
+   if(MathAbs(bid - basePriceSub) < minDistPrice)
+      return false;
+
+   // Cooldown (use AA/BB close timestamps as the last action time).
+   if(BALANCE_COOLDOWN_SEC_DEFAULT > 0)
+   {
+      datetime lastClose = MathMax(lastBalanceAAByBBCloseTimeSub, lastBalanceBBCloseTimeSub);
+      if(lastClose > 0 && (TimeCurrent() - lastClose) < BALANCE_COOLDOWN_SEC_DEFAULT)
+         return false;
+   }
+
+   // Condition from request:
+   // (sumPos + sumNegAbs) >= X USD
+   double sumPos = 0.0;
+   double sumNegAbs = 0.0;
+
+   ulong posTickets[];
+   double posPls[];
+   double posVols[];
+   double posOpenPrices[];
+   int posTypes[]; // 0=AA,1=BB
+   ArrayResize(posTickets, 0);
+   ArrayResize(posPls, 0);
+   ArrayResize(posVols, 0);
+   ArrayResize(posOpenPrices, 0);
+   ArrayResize(posTypes, 0);
+
+   ulong negTickets[];
+   double negPls[];
+   double negVols[];
+   double negOpenPrices[];
+   int negTypes[]; // 0=AA,1=BB
+   ArrayResize(negTickets, 0);
+   ArrayResize(negPls, 0);
+   ArrayResize(negVols, 0);
+   ArrayResize(negOpenPrices, 0);
+   ArrayResize(negTypes, 0);
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!IsSubMagic(PositionGetInteger(POSITION_MAGIC)) || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      int typ = -1;
+      if(magic == MagicAA_Sub) typ = 0;
+      else if(magic == MagicBB_Sub) typ = 1;
+      else continue;
+
+      if(sessionStartTimeSub > 0 && (datetime)PositionGetInteger(POSITION_TIME) < sessionStartTimeSub)
+         continue;
+
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+
+      // Across base: same side and opposite side relative to current price vs base.
+      bool isSameSide = (priceAboveBase) ? (openPrice > basePriceSub) : (openPrice < basePriceSub);
+      bool isOppSide  = (priceAboveBase) ? (openPrice < basePriceSub) : (openPrice > basePriceSub);
+      if(!isSameSide && !isOppSide)
+         continue;
+
+      double tp = PositionGetDouble(POSITION_TP);
+      if(tp > 0.0)
+         continue; // no TP configured only
+
+      double pr = GetPositionPnL(ticket); // profit+swap+commission
+
+      if(isSameSide && pr > 0.0)
+      {
+         sumPos += pr;
+         int n = ArraySize(posTickets);
+         ArrayResize(posTickets, n + 1);
+         ArrayResize(posPls, n + 1);
+         ArrayResize(posVols, n + 1);
+         ArrayResize(posOpenPrices, n + 1);
+         ArrayResize(posTypes, n + 1);
+         posTickets[n] = ticket;
+         posPls[n] = pr;
+         posVols[n] = PositionGetDouble(POSITION_VOLUME);
+         posOpenPrices[n] = openPrice;
+         posTypes[n] = typ;
+      }
+      else if(isOppSide && pr < 0.0)
+      {
+         double absLoss = -pr;
+         sumNegAbs += absLoss;
+         int n = ArraySize(negTickets);
+         ArrayResize(negTickets, n + 1);
+         ArrayResize(negPls, n + 1);
+         ArrayResize(negVols, n + 1);
+         ArrayResize(negOpenPrices, n + 1);
+         ArrayResize(negTypes, n + 1);
+         negTickets[n] = ticket;
+         negPls[n] = pr; // negative
+         negVols[n] = PositionGetDouble(POSITION_VOLUME);
+         negOpenPrices[n] = openPrice;
+         negTypes[n] = typ;
+      }
+   }
+
+   if((sumPos + sumNegAbs) < xUSD)
+      return false;
+
+   if(ArraySize(posTickets) <= 0 || ArraySize(negTickets) <= 0)
+      return false;
+
+   // Sort positive candidates: farthest from base first; then AA->BB
+   int pcnt = ArraySize(posTickets);
+   for(int i = 0; i < pcnt - 1; i++)
+      for(int j = i + 1; j < pcnt; j++)
+      {
+         double di = MathAbs(posOpenPrices[i] - basePriceSub);
+         double dj = MathAbs(posOpenPrices[j] - basePriceSub);
+         bool swap = (dj > di);
+         if(!swap && MathAbs(dj - di) < gridStep * 0.5 && posTypes[j] < posTypes[i])
+            swap = true;
+         if(swap)
+         {
+            ulong t = posTickets[i]; posTickets[i] = posTickets[j]; posTickets[j] = t;
+            double p = posPls[i]; posPls[i] = posPls[j]; posPls[j] = p;
+            double v = posVols[i]; posVols[i] = posVols[j]; posVols[j] = v;
+            double op = posOpenPrices[i]; posOpenPrices[i] = posOpenPrices[j]; posOpenPrices[j] = op;
+            int tt = posTypes[i]; posTypes[i] = posTypes[j]; posTypes[j] = tt;
+         }
+      }
+
+   // Sort negative candidates: farthest from base first; then AA->BB
+   int ncnt = ArraySize(negTickets);
+   for(int i = 0; i < ncnt - 1; i++)
+      for(int j = i + 1; j < ncnt; j++)
+      {
+         double di = MathAbs(negOpenPrices[i] - basePriceSub);
+         double dj = MathAbs(negOpenPrices[j] - basePriceSub);
+         bool swap = (dj > di);
+         if(!swap && MathAbs(dj - di) < gridStep * 0.5 && negTypes[j] < negTypes[i])
+            swap = true;
+         if(swap)
+         {
+            ulong t = negTickets[i]; negTickets[i] = negTickets[j]; negTickets[j] = t;
+            double p = negPls[i]; negPls[i] = negPls[j]; negPls[j] = p;
+            double v = negVols[i]; negVols[i] = negVols[j]; negVols[j] = v;
+            double op = negOpenPrices[i]; negOpenPrices[i] = negOpenPrices[j]; negOpenPrices[j] = op;
+            int tt = negTypes[i]; negTypes[i] = negTypes[j]; negTypes[j] = tt;
+         }
+      }
+
+   // Close exactly 2 orders: top positive + top negative
+   ulong posTicket = posTickets[0];
+   ulong negTicket = negTickets[0];
+   int posType = posTypes[0];
+   int negType = negTypes[0];
+   double posPr = posPls[0];
+   double negPr = negPls[0]; // negative
+   double posVol = posVols[0];
+   double negVol = negVols[0];
+
+   double balanceFloor = sessionStartBalanceSub + lockedProfitReserveSub;
+   double balanceNow = AccountInfoDouble(ACCOUNT_BALANCE);
+   bool anyClosed = false;
+   bool posClosed = false;
+
+   // Close profitable first
+   if(PositionCloseWithComment(posTicket, "Balance open (no TP) profit order"))
+   {
+      sessionClosedProfitRemainingSub += posPr;
+      balanceNow += posPr;
+      anyClosed = true;
+      posClosed = true;
+
+      if(posType == 0) lastBalanceAAByBBCloseTimeSub = TimeCurrent();
+      else if(posType == 1) lastBalanceBBCloseTimeSub = TimeCurrent();
+   }
+
+   // Close losing opposite-side (possibly partial) if profitable is closed
+   if(negPr < 0.0 && posClosed)
+   {
+      double absLoss = -negPr;
+      if(absLoss <= 0.0) return anyClosed;
+
+      double desiredPortion = posPr / absLoss; // 0..1 (if <1, partial close)
+      desiredPortion = MathMax(0.0, MathMin(1.0, desiredPortion));
+
+      double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+      // Additionally ensure we don't drop below floor after closing full loss.
+      double ratioAllowedByFloor = 1.0;
+      double balanceAfterFullLoss = balanceNow + negPr; // negPr <0
+      if(balanceAfterFullLoss < balanceFloor)
+      {
+         ratioAllowedByFloor = (balanceFloor - balanceNow) / negPr; // negPr<0 -> positive
+         ratioAllowedByFloor = MathMax(0.0, MathMin(1.0, ratioAllowedByFloor));
+      }
+      desiredPortion = MathMin(desiredPortion, ratioAllowedByFloor);
+
+      double volClose = negVol * desiredPortion;
+      volClose = MathFloor(volClose / lotStep) * lotStep;
+      if(volClose < minLot)
+         return anyClosed;
+
+      if(desiredPortion >= 0.999 || volClose >= (negVol - lotStep * 0.5))
+      {
+         if(PositionCloseWithComment(negTicket, "Balance open (no TP) loss order"))
+         {
+            sessionClosedProfitRemainingSub += negPr;
+            anyClosed = true;
+            if(negType == 0) lastBalanceAAByBBCloseTimeSub = TimeCurrent();
+            else if(negType == 1) lastBalanceBBCloseTimeSub = TimeCurrent();
+         }
+      }
+      else
+      {
+         if(PositionClosePartialWithComment(negTicket, volClose, "Balance open (no TP) loss order"))
+         {
+            double realizedPnL = (volClose / negVol) * negPr; // negative
+            sessionClosedProfitRemainingSub += realizedPnL;
+            anyClosed = true;
+            if(negType == 0) lastBalanceAAByBBCloseTimeSub = TimeCurrent();
+            else if(negType == 1) lastBalanceBBCloseTimeSub = TimeCurrent();
+         }
+      }
+   }
+
+   return anyClosed;
+}
+
 bool ScheduleRestartDelayAfterReset(const string reason)
 {
    if(RestartDelayMinutesAfterReset <= 0)
@@ -902,10 +1353,287 @@ bool ScheduleRestartDelayAfterResetSub(const string reason)
       return false;
    restartDelayUntilSub = TimeCurrent() + (RestartDelayMinutesAfterReset * 60);
    eaStoppedByRestartDelaySub = true;
-   Print("Sub ", reason, ": restart delayed for ", RestartDelayMinutesAfterReset, " minutes.");
+   string prefix = "";
+   // Avoid double prefix: callers may pass reason like "Sub xxx".
+   if(StringFind(reason, "Sub ") != 0 && StringFind(reason, "SUB ") != 0)
+      prefix = "Sub ";
+   Print(prefix, reason, ": restart delayed for ", RestartDelayMinutesAfterReset, " minutes.");
    if(EnableResetNotification || EnableTelegram)
-      SendResetNotification("Sub " + reason + ": waiting " + IntegerToString(RestartDelayMinutesAfterReset) + " min before restart");
+      SendResetNotification(prefix + reason + ": waiting " + IntegerToString(RestartDelayMinutesAfterReset) + " min before restart");
    return true;
+}
+
+void ResetDailyStopStateSub()
+{
+   dailyKeySub = DateKey(TimeCurrent());
+   dailyStopDayKeySub = 0;
+   dailyResetProfitSub = 0.0;
+}
+
+// Sub daily target cycle reset (independent from main)
+void CheckDailyRolloverAndAutoRestartSub()
+{
+   if(!EnableDailyStop || DailyProfitTargetUSD <= 0)
+      return;
+
+   int k = DateKey(TimeCurrent());
+   if(dailyKeySub == 0)
+      dailyKeySub = k;
+   if(k == dailyKeySub)
+      return;
+
+   // New day
+   dailyKeySub = k;
+
+   // Only clear daily stop on the NEXT day after it was reached.
+   if(eaStoppedByTargetSub && dailyStopDayKeySub > 0 && k > dailyStopDayKeySub)
+   {
+      eaStoppedByTargetSub = false;
+      dailyStopDayKeySub = 0;
+      dailyResetProfitSub = 0.0;
+
+      // Do not start immediately; sub activation is distance-gated.
+      if(EnableTradingHours && !IsWithinTradingHours(TimeCurrent()))
+      {
+         eaStoppedByScheduleSub = true;
+         return;
+      }
+
+      // Weekday + start filters determine whether sub can activate.
+      if(EnableWeekdaySchedule && !IsAllowedWeekday(TimeCurrent()))
+      {
+         eaStoppedByWeekdaySub = true;
+         return;
+      }
+
+      if(EnableADXStartFilter && !IsADXStartAllowed())
+      {
+         eaStoppedByAdxSub = true;
+         if(EnableResetNotification || EnableTelegram)
+            SendResetNotification("Sub restart delay done: waiting for ADX start condition");
+         return;
+      }
+      if(EnableRSIStartFilter && !IsRSIStartAllowed())
+      {
+         eaStoppedByRsiSub = true;
+         if(EnableResetNotification || EnableTelegram)
+            SendResetNotification("Sub restart delay done: waiting for RSI cross start condition");
+         return;
+      }
+
+      eaStoppedByScheduleSub = false;
+      eaStoppedByWeekdaySub = false;
+      eaStoppedByAdxSub = false;
+      eaStoppedByRsiSub = false;
+   }
+}
+
+// Call this once per SUB reset (before DisableSubEngineAndMaybeRestart clears sessionStartBalanceSub).
+void DailyStopOnResetAccumulateAndMaybeStopSub(const string resetReason)
+{
+   if(!EnableDailyStop || DailyProfitTargetUSD <= 0)
+      return;
+
+   CheckDailyRolloverAndAutoRestartSub();
+
+   double balNow = AccountInfoDouble(ACCOUNT_BALANCE);
+   double delta = balNow - sessionStartBalanceSub; // P/L of the sub-session that just ended
+   dailyResetProfitSub += delta;
+
+   if(dailyResetProfitSub >= DailyProfitTargetUSD)
+   {
+      eaStoppedByTargetSub = true;
+      dailyStopDayKeySub = DateKey(TimeCurrent());
+      CancelAllPendingOrdersSub();
+      Print("Sub daily stop reached: ", dailyResetProfitSub, " USD >= target ", DailyProfitTargetUSD, ". Reason: ", resetReason);
+      if(EnableResetNotification)
+         SendResetNotification("Sub daily stop reached (" + DoubleToString(dailyResetProfitSub, 2) + " USD) - SUB stopped");
+   }
+}
+
+void TradingHoursStopOnResetIfNeededSub(const string resetReason)
+{
+   if(!EnableTradingHours)
+      return;
+
+   datetime now = TimeCurrent();
+   if(!IsWithinTradingHours(now) && scheduleStopPendingSub)
+   {
+      eaStoppedByScheduleSub = true;
+      scheduleStopPendingSub = false;
+      CancelAllPendingOrdersSub();
+      Print("Sub trading hours ended: stop on RESET. Reason: ", resetReason);
+      if(EnableResetNotification || EnableTelegram)
+         SendResetNotification("Sub trading hours ended: SUB stopped (waiting next start window)");
+   }
+}
+
+void WeekdayStopOnResetIfNeededSub(const string resetReason)
+{
+   if(!EnableWeekdaySchedule)
+      return;
+
+   datetime now = TimeCurrent();
+   if((!IsAllowedWeekday(now) && weekdayStopPendingSub) || !IsAllowedWeekday(now))
+   {
+      eaStoppedByWeekdaySub = true;
+      weekdayStopPendingSub = false;
+      CancelAllPendingOrdersSub();
+      Print("Sub weekday schedule: stop on RESET. Reason: ", resetReason);
+      if(EnableResetNotification || EnableTelegram)
+         SendResetNotification("Sub weekday schedule: SUB stopped (waiting allowed day)");
+   }
+}
+
+void CheckTradingHoursAndAutoRestartSub()
+{
+   if(!EnableTradingHours)
+      return;
+
+   datetime now = TimeCurrent();
+   bool within = IsWithinTradingHours(now);
+   static bool lastWithinSub = true;
+
+   if(eaStoppedByRestartDelaySub)
+   {
+      lastWithinSub = within;
+      return;
+   }
+
+   // Detect crossing out of the window while running -> stop pending until next reset
+   if(lastWithinSub && !within && subActive && !eaStoppedByScheduleSub && !eaStoppedByTargetSub)
+      scheduleStopPendingSub = true;
+
+   // If schedule-stopped, restart flags when we enter the window
+   if(eaStoppedByScheduleSub && within && !eaStoppedByTargetSub)
+   {
+      eaStoppedByScheduleSub = false;
+      scheduleStopPendingSub = false;
+
+      if(EnableWeekdaySchedule && !IsAllowedWeekday(now))
+      {
+         eaStoppedByWeekdaySub = true;
+         return;
+      }
+      if(EnableADXStartFilter && !IsADXStartAllowed())
+      {
+         eaStoppedByAdxSub = true;
+         return;
+      }
+      if(EnableRSIStartFilter && !IsRSIStartAllowed())
+      {
+         eaStoppedByRsiSub = true;
+         return;
+      }
+
+      eaStoppedByWeekdaySub = false;
+      eaStoppedByAdxSub = false;
+      eaStoppedByRsiSub = false;
+   }
+
+   lastWithinSub = within;
+}
+
+void CheckADXStartAndAutoRestartSub()
+{
+   if(!EnableADXStartFilter)
+      return;
+   if(eaStoppedByRestartDelaySub)
+      return;
+   if(EnableWeekdaySchedule && !IsAllowedWeekday(TimeCurrent()))
+      return;
+   if(!eaStoppedByAdxSub)
+      return;
+   if(eaStoppedByTargetSub)
+      return;
+   if(EnableTradingHours && !IsWithinTradingHours(TimeCurrent()))
+      return;
+   if(!IsADXStartAllowed())
+      return;
+   if(EnableRSIStartFilter && !IsRSIStartAllowed())
+      return;
+
+   // Start conditions satisfied -> clear flags; TryActivateSubEngine will activate if distance allows.
+   eaStoppedByAdxSub = false;
+   eaStoppedByRsiSub = false;
+}
+
+void CheckRSIStartAndAutoRestartSub()
+{
+   if(!EnableRSIStartFilter)
+      return;
+   if(eaStoppedByRestartDelaySub)
+      return;
+   if(EnableWeekdaySchedule && !IsAllowedWeekday(TimeCurrent()))
+      return;
+   if(!eaStoppedByRsiSub)
+      return;
+   if(eaStoppedByTargetSub)
+      return;
+   if(EnableTradingHours && !IsWithinTradingHours(TimeCurrent()))
+      return;
+
+   if(!IsRSIStartAllowed())
+      return;
+   if(EnableADXStartFilter && !IsADXStartAllowed())
+      return;
+
+   eaStoppedByRsiSub = false;
+   eaStoppedByAdxSub = false;
+}
+
+void CheckWeekdayAndAutoRestartSub()
+{
+   if(!EnableWeekdaySchedule)
+      return;
+
+   datetime now = TimeCurrent();
+   bool allowed = IsAllowedWeekday(now);
+   static int lastKeySub = 0;
+   static bool lastAllowedSub = true;
+
+   int key = DateKey(now);
+   if(lastKeySub == 0)
+   {
+      lastKeySub = key;
+      lastAllowedSub = allowed;
+   }
+
+   // New day detection
+   if(key != lastKeySub)
+   {
+      if(lastAllowedSub && !allowed && !eaStoppedByWeekdaySub && !eaStoppedByTargetSub)
+      {
+         weekdayStopPendingSub = true;
+      }
+      lastKeySub = key;
+      lastAllowedSub = allowed;
+   }
+
+   // If weekday-stopped, clear when allowed and other conditions allow activation.
+   if(eaStoppedByWeekdaySub && allowed && !eaStoppedByTargetSub && !eaStoppedByRestartDelaySub)
+   {
+      if(EnableTradingHours && !IsWithinTradingHours(now))
+      {
+         eaStoppedByScheduleSub = true;
+         return;
+      }
+      if(EnableADXStartFilter && !IsADXStartAllowed())
+      {
+         eaStoppedByAdxSub = true;
+         return;
+      }
+      if(EnableRSIStartFilter && !IsRSIStartAllowed())
+      {
+         eaStoppedByRsiSub = true;
+         return;
+      }
+
+      eaStoppedByWeekdaySub = false;
+      weekdayStopPendingSub = false;
+      eaStoppedByAdxSub = false;
+      eaStoppedByRsiSub = false;
+   }
 }
 
 void ResetDailyStopState()
@@ -1420,6 +2148,16 @@ int OnInit()
    dgt = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    pnt = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    basePrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);   // On startup: base line = current price
+
+  // Chart display is disabled in V3: cleanup any previously drawn objects.
+  string names[] = {"VPGRID_BASE_MAIN","VPGRID_BASE_SUB","VPGRID_ZONE_MAIN_UP","VPGRID_ZONE_MAIN_DN","VPGRID_ZONE_SUB_UP","VPGRID_ZONE_SUB_DN"};
+  for(int i = 0; i < ArraySize(names); i++)
+  {
+     if(ObjectFind(0, names[i]) >= 0)
+        ObjectDelete(0, names[i]);
+  }
+  mainZoneActive = false;
+  subZoneActive = false;
    sessionClosedProfit = 0.0;
    sessionLockedProfit = 0.0;
    sessionClosedProfitBB = 0.0;
@@ -1435,6 +2173,10 @@ int OnInit()
    lastBalanceAAByBBCloseTime = 0;
    balanceSelectedLevelPrice = 0.0;
    ArrayResize(balanceSelectedTickets, 0);
+   balanceSelectedLevelPriceSub = 0.0;
+   ArrayResize(balanceSelectedTicketsSub, 0);
+   balancePrepareDirectionSub = 0;
+   balancePreparedTicketSub = 0;
    lastResetTime = 0;
    lastResetTimeSub = 0;
    eaStoppedByTarget = false;
@@ -1466,6 +2208,8 @@ int OnInit()
    sessionPeakProfitSub = 0.0;
    sessionPeakBalanceSub = 0.0;
    sessionMinBalanceSub = 0.0;
+   lastBalanceAAByBBCloseTimeSub = 0;
+   lastBalanceBBCloseTimeSub = 0;
 
    if(EnableADXStartFilter)
    {
@@ -1507,6 +2251,7 @@ int OnInit()
    sessionTotalLotAtMaxLot = 0.0;
    
    ResetDailyStopState();
+   ResetDailyStopStateSub();
    // If trading-hours mode is enabled and we're outside the window, do not start placing the grid now.
    if(EnableTradingHours && !IsWithinTradingHours(TimeCurrent()))
    {
@@ -1611,6 +2356,12 @@ void OnTick()
    CheckRestartDelayAndAutoRestart();
    CheckADXStartAndAutoRestart();
    CheckRSIStartAndAutoRestart();
+   // SUB: independent stop/start state machines
+   CheckDailyRolloverAndAutoRestartSub();
+   CheckWeekdayAndAutoRestartSub();
+   CheckTradingHoursAndAutoRestartSub();
+   CheckADXStartAndAutoRestartSub();
+   CheckRSIStartAndAutoRestartSub();
    bool mainStopped = (eaStoppedByTarget || eaStoppedBySchedule || eaStoppedByWeekday || eaStoppedByAdx || eaStoppedByRsi || eaStoppedByRestartDelay);
 
    // Virtual pendings: execute for BOTH main and sub before any stop/logic early return.
@@ -1622,9 +2373,112 @@ void OnTick()
    // Sub reset mode 12 (independent of main stopped state)
    TryResetMode12Sub();
 
+   // Chart display (base lines / open-zone rectangles) is disabled in V3.
+
    bool subStopped = (eaStoppedByTargetSub || eaStoppedByScheduleSub || eaStoppedByWeekdaySub || eaStoppedByAdxSub || eaStoppedByRsiSub || eaStoppedByRestartDelaySub);
    if(subActive && !subStopped)
       ManageGridOrdersSub();
+
+   // --- SUB independent mode handling (trailing + session profit reset) ---
+   double floatingSub = 0.0;
+   int posCountSub = 0; // current sub-session open positions count
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0 || !IsSubMagic(PositionGetInteger(POSITION_MAGIC)) || PositionGetString(POSITION_SYMBOL) != _Symbol)
+         continue;
+      if(sessionStartTimeSub > 0 && (datetime)PositionGetInteger(POSITION_TIME) < sessionStartTimeSub)
+         continue; // Skip positions opened before current sub session
+      posCountSub++;
+      floatingSub += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+   }
+   double totalForTrailingSub = floatingSub;
+   double effectiveTrailingThresholdSub = (EnableScaleByAccountGrowth && TrailingThresholdUSD > 0) ?
+      (TrailingThresholdUSD * sessionMultiplierSub) : TrailingThresholdUSD;
+
+   // Sub: trailing total profit (gong lãi tổng) - independent from MAIN.
+   if(subActive && EnableTrailingTotalProfit && TrailingThresholdUSD > 0)
+   {
+      if(!gongLaiModeSub)
+      {
+         if(totalForTrailingSub >= effectiveTrailingThresholdSub)
+         {
+            gongLaiModeSub = true;
+            trailingSLPlacedSub = false;
+            trailingGocBuySub = 0.0;
+            trailingGocSellSub = 0.0;
+            lastBuyTrailPriceSub = 0.0;
+            lastSellTrailPriceSub = 0.0;
+            sessionPeakProfitSub = 0.0;
+            CancelAllPendingOrdersSub();
+            RemoveTPFromAllSubSessionPositions();
+            Print("Sub trailing: open profit ", totalForTrailingSub, " USD (>= ",
+                  effectiveTrailingThresholdSub, "). Pending cancelled, TP removed.");
+         }
+      }
+
+      // Trigger on profit drop
+      if(gongLaiModeSub && TrailingDropPct > 0)
+      {
+         double pct = MathMax(0.0, MathMin(100.0, TrailingDropPct));
+         double dropLevel = effectiveTrailingThresholdSub * (1.0 - pct / 100.0);
+         if(totalForTrailingSub <= dropLevel)
+         {
+            if(TrailingDropMode == TRAILING_MODE_RETURN)
+            {
+               if(!trailingSLPlacedSub)
+               {
+                  gongLaiModeSub = false;
+                  trailingGocBuySub = 0.0;
+                  trailingGocSellSub = 0.0;
+                  trailingSLPlacedSub = false;
+                  lastBuyTrailPriceSub = 0.0;
+                  lastSellTrailPriceSub = 0.0;
+                  sessionPeakProfitSub = 0.0;
+                  // Re-add virtual pendings for SUB
+                  if(subActive && !subStopped)
+                     ManageGridOrdersSub();
+               }
+            }
+            else if(TrailingDropMode == TRAILING_MODE_LOCK)
+            {
+               if(!trailingSLPlacedSub)
+               {
+                  DisableSubEngineAndMaybeRestart("Sub trailing profit (lock)", true);
+                  // stop here: subActive is now false
+               }
+            }
+         }
+      }
+
+      // SL trailing updates
+      if(gongLaiModeSub && subActive && !subStopped)
+         DoGongLaiTrailingSub();
+   }
+
+   // If trailing SL just caused all SUB positions to close -> reset SUB engine.
+   if(gongLaiModeSub && posCountSub == 0 && subActive)
+   {
+      DisableSubEngineAndMaybeRestart("Sub trailing SL hit", true);
+   }
+
+   // Sub: session profit reset (mode 11) - independent from MAIN.
+   if(subActive && !gongLaiModeSub && EnableSessionProfitReset && SessionProfitTargetUSD > 0)
+   {
+      double balDeltaSub = AccountInfoDouble(ACCOUNT_BALANCE) - sessionStartBalanceSub;
+      double totalSessionSub = balDeltaSub + floatingSub;
+      if(totalSessionSub >= SessionProfitTargetUSD)
+      {
+         DisableSubEngineAndMaybeRestart("Sub session profit target reached", true);
+      }
+   }
+
+   // Sub: full balance engine (AA/BB + no-TP across base), independent from MAIN.
+   if(subActive && !subStopped)
+   {
+      sessionClosedProfitRemainingSub = sessionClosedProfitSub;
+      DoBalanceAllSub();
+   }
 
    // Preserve original behavior: if main is stopped, do not run main logic this tick.
    if(mainStopped)
@@ -2024,6 +2878,27 @@ void UpdateSessionMultiplierFromAccountGrowth()
    }
 }
 
+// Sub: update separate sessionMultiplierSub on sub reset/activation.
+void UpdateSessionMultiplierFromAccountGrowthSub()
+{
+   if(balanceGoc <= 0)
+      return;
+   double newBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double growth = (newBalance - balanceGoc) / balanceGoc;
+   if(EnableScaleByAccountGrowth && AccountGrowthScalePct > 0)
+   {
+      double pct = MathMin(100.0, MathMax(0.0, AccountGrowthScalePct));
+      sessionMultiplierSub = 1.0 + growth * (pct / 100.0);
+      if(sessionMultiplierSub < 0.1) sessionMultiplierSub = 0.1;
+      double maxMult = (MaxScaleIncreasePct > 0) ? (1.0 + MaxScaleIncreasePct / 100.0) : 10.0;
+      if(sessionMultiplierSub > maxMult) sessionMultiplierSub = maxMult;
+   }
+   else
+   {
+      sessionMultiplierSub = 1.0;
+   }
+}
+
 //+------------------------------------------------------------------+
 //| Update peak/min balance (session + global since EA attach) and max lot in session |
 //+------------------------------------------------------------------+
@@ -2111,6 +2986,7 @@ void SendTelegramMessage(const string msg)
 void SendResetNotification(const string reason)
 {
    if(!EnableResetNotification && !EnableTelegram) return;
+   bool isSub = (StringFind(reason, "Sub ") == 0 || StringFind(reason, "SUB ") == 0);
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    int symDigits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
@@ -2135,8 +3011,10 @@ void SendResetNotification(const string reason)
    msg += "Lowest balance (since attach): " + DoubleToString(globalMinBalance, 2) + " USD\n";
    if(EnableDailyStop && DailyProfitTargetUSD > 0)
    {
-      msg += "Daily reset-profit progress: " + DoubleToString(dailyResetProfit, 2) + " / " + DoubleToString(DailyProfitTargetUSD, 2) + " USD\n";
-      if(eaStoppedByTarget)
+      double dprog = isSub ? dailyResetProfitSub : dailyResetProfit;
+      bool dstopped = isSub ? eaStoppedByTargetSub : eaStoppedByTarget;
+      msg += "Daily reset-profit progress: " + DoubleToString(dprog, 2) + " / " + DoubleToString(DailyProfitTargetUSD, 2) + " USD\n";
+      if(dstopped)
          msg += "Daily stop: EA is STOPPED until next day\n";
    }
    if(EnableTradingHours)
@@ -2144,17 +3022,21 @@ void SendResetNotification(const string reason)
       string win = StringFormat("%02d:%02d-%02d:%02d", ClampInt(TradingStartHour,0,23), ClampInt(TradingStartMinute,0,59),
                                 ClampInt(TradingEndHour,0,23), ClampInt(TradingEndMinute,0,59));
       msg += "Trading hours: " + win + "\n";
-      if(eaStoppedBySchedule)
+      bool stoppedSchedule = isSub ? eaStoppedByScheduleSub : eaStoppedBySchedule;
+      bool stopPending = isSub ? scheduleStopPendingSub : scheduleStopPending;
+      if(stoppedSchedule)
          msg += "Trading hours: EA is WAITING for next start\n";
-      else if(scheduleStopPending)
+      else if(stopPending)
          msg += "Trading hours: stop pending (will stop on next reset)\n";
    }
    if(EnableWeekdaySchedule)
    {
       msg += "Weekday schedule: enabled\n";
-      if(eaStoppedByWeekday)
+      bool stoppedWeekday = isSub ? eaStoppedByWeekdaySub : eaStoppedByWeekday;
+      bool pendingWeekday = isSub ? weekdayStopPendingSub : weekdayStopPending;
+      if(stoppedWeekday)
          msg += "Weekday schedule: EA is WAITING for allowed day\n";
-      else if(weekdayStopPending)
+      else if(pendingWeekday)
          msg += "Weekday schedule: stop pending (will stop on next reset)\n";
    }
    if(EnableADXStartFilter)
@@ -2164,7 +3046,8 @@ void SendResetNotification(const string reason)
       msg += "ADX start filter: < " + DoubleToString(ADXStartThreshold, 1) + " (";
       msg += ok ? DoubleToString(adx, 2) : "n/a";
       msg += ")\n";
-      if(eaStoppedByAdx)
+      bool stoppedAdx = isSub ? eaStoppedByAdxSub : eaStoppedByAdx;
+      if(stoppedAdx)
          msg += "ADX filter: EA is WAITING for ADX condition\n";
    }
    if(EnableRSIStartFilter)
@@ -2177,17 +3060,22 @@ void SendResetNotification(const string reason)
       else
          msg += "n/a";
       msg += ")\n";
-      if(eaStoppedByRsi)
+      bool stoppedRsi = isSub ? eaStoppedByRsiSub : eaStoppedByRsi;
+      if(stoppedRsi)
          msg += "RSI filter: EA is WAITING for RSI cross\n";
    }
-   if(eaStoppedByRestartDelay && restartDelayUntil > 0)
+   if((isSub ? eaStoppedByRestartDelaySub : eaStoppedByRestartDelay) &&
+      (isSub ? restartDelayUntilSub : restartDelayUntil) > 0)
    {
-      int secLeft = (int)MathMax(0, (int)(restartDelayUntil - TimeCurrent()));
+      datetime until = isSub ? restartDelayUntilSub : restartDelayUntil;
+      int secLeft = (int)MathMax(0, (int)(until - TimeCurrent()));
       int minLeft = secLeft / 60;
       int remSec = secLeft % 60;
       msg += "Restart delay: EA is WAITING " + IntegerToString(minLeft) + "m " + IntegerToString(remSec) + "s before restart\n";
    }
-   msg += "Locked profit (saved, cumulative): " + DoubleToString(lockedProfitReserve, 2) + " USD\n\n";
+   msg += "Locked profit reserve (cumulative):\n";
+   msg += "  MAIN: " + DoubleToString(lockedProfitReserveMain, 2) + " USD\n";
+   msg += "  SUB : " + DoubleToString(lockedProfitReserveSub, 2) + " USD\n\n";
    msg += "--- FREE EA ---\n";
    msg += "Free MT5 automated trading EA.\n";
    msg += "Just register an account using this link: https://one.exnessonelink.com/a/iu0hffnbzb\n";
@@ -2223,6 +3111,28 @@ bool IsPositionLockedForBalance(ulong ticket, bool priceAboveBase)
    // Price above base -> lock Buy; price below base -> lock Sell
    if(priceAboveBase && posType == POSITION_TYPE_BUY) return true;   // Do not close Buy
    if(!priceAboveBase && posType == POSITION_TYPE_SELL) return true;  // Do not close Sell
+   return false;
+}
+
+bool IsLosingOppositeSidePositionSub(ulong ticket, bool priceAboveBase)
+{
+   if(ticket == 0 || !PositionSelectByTicket(ticket)) return false;
+   if(!IsSubMagic(PositionGetInteger(POSITION_MAGIC)) || PositionGetString(POSITION_SYMBOL) != _Symbol) return false;
+   double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double pr = GetPositionPnL(ticket);
+   if(pr >= 0.0) return false;
+   bool posBelowBase = (openPrice < basePriceSub);
+   bool posAboveBase = (openPrice > basePriceSub);
+   bool opposite = (priceAboveBase && posBelowBase) || (!priceAboveBase && posAboveBase);
+   return opposite;
+}
+
+bool IsPositionLockedForBalanceSub(ulong ticket, bool priceAboveBase)
+{
+   if(ticket == 0 || !PositionSelectByTicket(ticket)) return false;
+   ulong posType = PositionGetInteger(POSITION_TYPE);
+   if(priceAboveBase && posType == POSITION_TYPE_BUY) return true;
+   if(!priceAboveBase && posType == POSITION_TYPE_SELL) return true;
    return false;
 }
 
@@ -2293,6 +3203,13 @@ void ClearBalanceSelection()
    balancePreparedTicket = 0;
 }
 
+void ClearBalanceSelectionSub()
+{
+   balanceSelectedLevelPriceSub = 0.0;
+   ArrayResize(balanceSelectedTicketsSub, 0);
+   balancePreparedTicketSub = 0;
+}
+
 //+------------------------------------------------------------------+
 //| Remember/mark selected orders for balance preparation.             |
 //| Only ONE grid level (the farthest): store level price + tickets at that level. |
@@ -2323,6 +3240,33 @@ void MarkSelectedOrdersForBalance(ulong &tickets[], double &openPrices[], int cn
 void UpdateBalancePrepareMarks(ulong &tickets[], double &openPrices[], int cnt)
 {
    MarkSelectedOrdersForBalance(tickets, openPrices, cnt);
+}
+
+void MarkSelectedOrdersForBalanceSub(ulong &tickets[], double &openPrices[], int cnt)
+{
+   balanceSelectedLevelPriceSub = 0.0;
+   ArrayResize(balanceSelectedTicketsSub, 0);
+   balancePreparedTicketSub = 0;
+   if(cnt <= 0)
+      return;
+   double levelPrice0 = openPrices[0];
+   double tol = gridStep * 0.5;
+   balanceSelectedLevelPriceSub = levelPrice0;
+   for(int i = 0; i < cnt; i++)
+   {
+      if(MathAbs(openPrices[i] - levelPrice0) > tol)
+         break;
+      int n = ArraySize(balanceSelectedTicketsSub);
+      ArrayResize(balanceSelectedTicketsSub, n + 1);
+      balanceSelectedTicketsSub[n] = tickets[i];
+   }
+   if(ArraySize(balanceSelectedTicketsSub) > 0)
+      balancePreparedTicketSub = balanceSelectedTicketsSub[0];
+}
+
+void UpdateBalancePrepareMarksSub(ulong &tickets[], double &openPrices[], int cnt)
+{
+   MarkSelectedOrdersForBalanceSub(tickets, openPrices, cnt);
 }
 
 //+------------------------------------------------------------------+
@@ -2371,6 +3315,43 @@ void CloseAllPositionsAndOrdersSub()
    }
    VirtualPendingClearByMagic(MagicAA_Sub);
    VirtualPendingClearByMagic(MagicBB_Sub);
+   RearmBlocksClearByMagic(MagicAA_Sub);
+   RearmBlocksClearByMagic(MagicBB_Sub);
+}
+
+//+------------------------------------------------------------------+
+//| Cancel all pending orders (virtual+broker) for SUB only         |
+//+------------------------------------------------------------------+
+void CancelAllPendingOrdersSub()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket <= 0) continue;
+      long om = (long)OrderGetInteger(ORDER_MAGIC);
+      if(IsSubMagic(om) && OrderGetString(ORDER_SYMBOL) == _Symbol)
+         trade.OrderDelete(ticket);
+   }
+   VirtualPendingClearByMagic(MagicAA_Sub);
+   VirtualPendingClearByMagic(MagicBB_Sub);
+}
+
+//+------------------------------------------------------------------+
+//| Remove TP from all open SUB positions in current sub session   |
+//+------------------------------------------------------------------+
+void RemoveTPFromAllSubSessionPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!IsSubMagic(PositionGetInteger(POSITION_MAGIC)) || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(sessionStartTimeSub > 0 && (datetime)PositionGetInteger(POSITION_TIME) < sessionStartTimeSub) continue;
+      double curSL = PositionGetDouble(POSITION_SL);
+      double curTP = PositionGetDouble(POSITION_TP);
+      if(curTP > 0)
+         trade.PositionModify(ticket, curSL, 0);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -2422,6 +3403,22 @@ void RemoveTPFromAllSessionPositions()
       double curTP = PositionGetDouble(POSITION_TP);
       if(curTP > 0)
          trade.PositionModify(ticket, curSL, 0);
+   }
+}
+
+// Sub: close opposite side positions for SUB engine.
+void CloseOppositeSidePositionsSub(bool closeSells, bool onlyCurrentSession = false)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!IsSubMagic(PositionGetInteger(POSITION_MAGIC)) || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(onlyCurrentSession && sessionStartTimeSub > 0 && (datetime)PositionGetInteger(POSITION_TIME) < sessionStartTimeSub) continue;
+      if(closeSells && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         trade.PositionClose(ticket);
+      else if(!closeSells && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         trade.PositionClose(ticket);
    }
 }
 
@@ -2586,6 +3583,114 @@ void DoGongLaiTrailing()
 }
 
 //+------------------------------------------------------------------+
+//| Sub trailing: same algorithm as MAIN but for SUB engine         |
+//+------------------------------------------------------------------+
+void DoGongLaiTrailingSub()
+{
+   pointABaseLevelSub = 0.0;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double pipSize = (dgt == 5 || dgt == 3) ? (pnt * 10.0) : pnt;
+   double stepSize = GongLaiStepPips * pipSize;
+
+   if(bid > basePriceSub)
+   {
+      if(trailingGocBuySub <= 0.0)
+      {
+         int nLevels = ArraySize(gridLevelsSub);
+         for(int i = 0; i < MaxGridLevels && i < nLevels; i++)
+         {
+            double L = gridLevelsSub[i];
+            if(L < bid && L > trailingGocBuySub)
+               trailingGocBuySub = L;
+         }
+      }
+      if(trailingGocBuySub <= 0.0) { lastSellTrailPriceSub = 0.0; return; }
+      pointABaseLevelSub = trailingGocBuySub;
+
+      double pointA_Buy = trailingGocBuySub + TrailingPointAPips * pipSize;
+      double distPointAPips = TrailingPointAPips * pipSize;
+      double firstTriggerDist = distPointAPips + stepSize;
+      if((bid - trailingGocBuySub) < firstTriggerDist)
+         return;
+      int stepsBeyondFirst = (int)MathFloor(((bid - trailingGocBuySub) - firstTriggerDist) / stepSize);
+      double slBuyA = NormalizeDouble(pointA_Buy + stepsBeyondFirst * stepSize, dgt);
+      if(slBuyA >= bid)
+         return;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket <= 0) continue;
+         if(!IsSubMagic(PositionGetInteger(POSITION_MAGIC)) || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+         if(sessionStartTimeSub > 0 && (datetime)PositionGetInteger(POSITION_TIME) < sessionStartTimeSub) continue;
+
+         double curSL = PositionGetDouble(POSITION_SL);
+         double curTP = PositionGetDouble(POSITION_TP);
+         if(slBuyA > curSL && slBuyA < bid)
+         {
+            trade.PositionModify(ticket, slBuyA, curTP);
+            trailingSLPlacedSub = true;
+         }
+      }
+
+      lastSellTrailPriceSub = 0.0;
+      CloseOppositeSidePositionsSub(true, true);
+   }
+   else if(ask < basePriceSub)
+   {
+      if(trailingGocSellSub <= 0.0)
+      {
+         int nLevels = ArraySize(gridLevelsSub);
+         for(int i = MaxGridLevels; i < nLevels; i++)
+         {
+            double L = gridLevelsSub[i];
+            if(L > ask && (trailingGocSellSub <= 0.0 || L < trailingGocSellSub))
+               trailingGocSellSub = L;
+         }
+      }
+      if(trailingGocSellSub <= 0.0) { lastBuyTrailPriceSub = 0.0; return; }
+      pointABaseLevelSub = trailingGocSellSub;
+
+      double pointA_Sell = trailingGocSellSub - TrailingPointAPips * pipSize;
+      double distPointAPips = TrailingPointAPips * pipSize;
+      double firstTriggerDist = distPointAPips + stepSize;
+      if((trailingGocSellSub - ask) < firstTriggerDist)
+         return;
+      int stepsBeyondFirst = (int)MathFloor(((trailingGocSellSub - ask) - firstTriggerDist) / stepSize);
+      double slSellA = NormalizeDouble(pointA_Sell - stepsBeyondFirst * stepSize, dgt);
+      if(slSellA <= ask)
+         return;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket <= 0) continue;
+         if(!IsSubMagic(PositionGetInteger(POSITION_MAGIC)) || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) continue;
+         if(sessionStartTimeSub > 0 && (datetime)PositionGetInteger(POSITION_TIME) < sessionStartTimeSub) continue;
+
+         double curSL = PositionGetDouble(POSITION_SL);
+         double curTP = PositionGetDouble(POSITION_TP);
+         if((curSL <= 0 || slSellA < curSL) && slSellA > ask)
+         {
+            trade.PositionModify(ticket, slSellA, curTP);
+            trailingSLPlacedSub = true;
+         }
+      }
+
+      lastBuyTrailPriceSub = 0.0;
+      CloseOppositeSidePositionsSub(false, true);
+   }
+   else
+   {
+      lastBuyTrailPriceSub = 0.0;
+      lastSellTrailPriceSub = 0.0;
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Add closed profit/loss to session (by Magic)                       |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction& trans,
@@ -2651,12 +3756,14 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
    double dealPnL = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
                   + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
                   + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
-   // Lock profit (savings): apply the same % to AA/BB/CC/DD TP closes. lockedProfitReserve is cumulative; pool = TP - session lock.
+   // Lock profit (savings): apply the same % to AA/BB/CC/DD TP closes.
+   // We keep separate reserves for MAIN/SUB because balance actions use a "balance floor".
    if(EnableLockProfit && LockProfitPct > 0 && dealPnL > 0)
    {
       double pct = MathMin(100.0, MathMax(0.0, LockProfitPct));
       double locked = dealPnL * (pct / 100.0);
-      lockedProfitReserve += locked;   // Cumulative, never reset
+      if(isSubDeal) lockedProfitReserveSub += locked;
+      else lockedProfitReserveMain += locked;
       if(isSubDeal)
          sessionLockedProfitSub += locked;   // Sub: lock in sub-session
       else
@@ -2765,6 +3872,47 @@ double GetLotForLevel(ENUM_ORDER_TYPE orderType, int levelNum)
    return NormalizeDouble(lot, 2);
 }
 
+// Sub: lot calc for AA/BB using sessionMultiplierSub (separate scaling).
+double GetBaseLotForOrderTypeSub(ENUM_ORDER_TYPE orderType)
+{
+   if(orderType != ORDER_TYPE_BUY_STOP && orderType != ORDER_TYPE_SELL_STOP) return 0;
+   return (EnableScaleByAccountGrowth) ? (LotSizeAA * sessionMultiplierSub) : LotSizeAA;
+}
+
+ENUM_LOT_SCALE GetLotScaleForOrderTypeSub(ENUM_ORDER_TYPE orderType)
+{
+   if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP) return AALotScale;
+   return LOT_FIXED;
+}
+
+double GetLotMultForOrderTypeSub(ENUM_ORDER_TYPE orderType)
+{
+   if(orderType == ORDER_TYPE_BUY_STOP || orderType == ORDER_TYPE_SELL_STOP) return LotMultAA;
+   return 1.0;
+}
+
+double GetLotForLevelSub(ENUM_ORDER_TYPE orderType, int levelNum)
+{
+   int absLevel = MathAbs(levelNum);
+   double baseLot = GetBaseLotForOrderTypeSub(orderType);
+   ENUM_LOT_SCALE scale = GetLotScaleForOrderTypeSub(orderType);
+   double lot = baseLot;
+   if(absLevel <= 1 || scale == LOT_FIXED)
+      lot = baseLot;
+   else if(scale == LOT_GEOMETRIC)
+      lot = baseLot * MathPow(GetLotMultForOrderTypeSub(orderType), absLevel - 1);
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(MaxLotAA > 0)
+      maxLot = MathMin(maxLot, MaxLotAA);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathFloor(lot / lotStep) * lotStep;
+   if(lot < minLot) lot = minLot;
+   return NormalizeDouble(lot, 2);
+}
+
 //+------------------------------------------------------------------+
 //| Get Take Profit (pips) for order type; 0 = off                    |
 //+------------------------------------------------------------------+
@@ -2798,6 +3946,31 @@ double GetLotForLevelBB(bool isBuyStop, int levelNum)
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    if(MaxLotBB > 0)
       maxLot = MathMin(maxLot, MaxLotBB);   // BB max lot cap
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathFloor(lot / lotStep) * lotStep;
+   if(lot < minLot) lot = minLot;
+   return NormalizeDouble(lot, 2);
+}
+
+double GetBaseLotBBSub()
+{
+   return (EnableScaleByAccountGrowth) ? (LotSizeBB * sessionMultiplierSub) : LotSizeBB;
+}
+
+double GetLotForLevelBBSub(bool isBuyStop, int levelNum)
+{
+   int absLevel = MathAbs(levelNum);
+   double baseLot = GetBaseLotBBSub();
+   double lot = baseLot;
+   if(absLevel <= 1 || BBLotScale == LOT_FIXED)
+      lot = baseLot;
+   else if(BBLotScale == LOT_GEOMETRIC)
+      lot = baseLot * MathPow(LotMultBB, absLevel - 1);
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(MaxLotBB > 0)
+      maxLot = MathMin(maxLot, MaxLotBB);
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    lot = MathMax(minLot, MathMin(maxLot, lot));
    lot = MathFloor(lot / lotStep) * lotStep;
@@ -2912,6 +4085,10 @@ void InitializeGridLevels()
    for(int i = 0; i < totalLevels; i++)
       gridLevels[i] = GetGridLevelPrice(i);
    Print("Initialized ", totalLevels, " grid levels (", MaxGridLevels, " above + ", MaxGridLevels, " below base), spacing ", GridDistancePips, " pips");
+
+   // Chart display disabled: no base lines / zones.
+   mainZoneActive = false;
+   mainZoneStart = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -2924,6 +4101,10 @@ void InitializeGridLevelsSubOnly()
    for(int i = 0; i < totalLevels; i++)
       gridLevelsSub[i] = GetGridLevelPriceFromBase(basePriceSub, i);
    Print("Initialized SUB ", totalLevels, " grid levels (", MaxGridLevels, " above + ", MaxGridLevels, " below base), spacing ", GridDistancePips, " pips");
+
+   // Chart display disabled: no base lines / zones.
+   subZoneActive = false;
+   subZoneStart = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -2932,6 +4113,53 @@ void InitializeGridLevelsSubOnly()
 void TryActivateSubEngine()
 {
    if(!EnableSub || subActive)
+      return;
+   // Respect sub restart delay (independent)
+   if(eaStoppedByRestartDelaySub)
+   {
+      if(restartDelayUntilSub > 0 && TimeCurrent() < restartDelayUntilSub)
+         return;
+      eaStoppedByRestartDelaySub = false;
+      restartDelayUntilSub = 0;
+
+      // After restart delay: apply same start gating logic as MAIN.
+      datetime now = TimeCurrent();
+      if(EnableWeekdaySchedule && !IsAllowedWeekday(now))
+      {
+         eaStoppedByWeekdaySub = true;
+         if(EnableResetNotification || EnableTelegram)
+            SendResetNotification("Sub restart delay done: waiting allowed weekday to start");
+         return;
+      }
+      if(EnableTradingHours && !IsWithinTradingHours(now))
+      {
+         eaStoppedByScheduleSub = true;
+         if(EnableResetNotification || EnableTelegram)
+            SendResetNotification("Sub restart delay done: waiting trading hours start");
+         return;
+      }
+      if(EnableADXStartFilter && !IsADXStartAllowed())
+      {
+         eaStoppedByAdxSub = true;
+         if(EnableResetNotification || EnableTelegram)
+            SendResetNotification("Sub restart delay done: waiting for ADX start condition");
+         return;
+      }
+      if(EnableRSIStartFilter && !IsRSIStartAllowed())
+      {
+         eaStoppedByRsiSub = true;
+         if(EnableResetNotification || EnableTelegram)
+            SendResetNotification("Sub restart delay done: waiting for RSI cross start condition");
+         return;
+      }
+
+      eaStoppedByWeekdaySub = false;
+      eaStoppedByScheduleSub = false;
+      eaStoppedByAdxSub = false;
+      eaStoppedByRsiSub = false;
+   }
+   // If sub is stopped by daily target / schedule / filters, do not activate yet.
+   if(eaStoppedByTargetSub || eaStoppedByScheduleSub || eaStoppedByWeekdaySub || eaStoppedByAdxSub || eaStoppedByRsiSub)
       return;
    if(MagicAA_Sub == 0 || MagicBB_Sub == 0)
       return;
@@ -2949,6 +4177,7 @@ void TryActivateSubEngine()
    subActive = true;
 
    // Sub session init
+   UpdateSessionMultiplierFromAccountGrowthSub();
    sessionStartTimeSub = TimeCurrent();
    sessionStartBalanceSub = AccountInfoDouble(ACCOUNT_BALANCE);
    sessionClosedProfitSub = 0.0;
@@ -2988,6 +4217,89 @@ void TryActivateSubEngine()
    Print("Sub activated: baseMain=", DoubleToString(basePrice, _Digits), " baseSub=", DoubleToString(basePriceSub, _Digits),
          " dist=", DoubleToString(distPrice, _Digits), " need=", DoubleToString(needPrice, _Digits),
          " (SubDistanceFromMainBasePips=", DoubleToString(SubDistanceFromMainBasePips, 1), " pips)");
+}
+
+//+------------------------------------------------------------------+
+//| SUB reset/disable: close sub engine + wait for re-activation   |
+//+------------------------------------------------------------------+
+void DisableSubEngineAndMaybeRestart(const string reason, bool scheduleRestartDelay)
+{
+   if(!subActive && !gongLaiModeSub)
+      return;
+
+   CloseAllPositionsAndOrdersSub();
+
+   // Update sub scaling for the next sub-session if enabled.
+   UpdateSessionMultiplierFromAccountGrowthSub();
+
+   // Apply daily/trading-hours/weekday stop rules (sub independent).
+   DailyStopOnResetAccumulateAndMaybeStopSub(reason);
+   TradingHoursStopOnResetIfNeededSub(reason);
+   WeekdayStopOnResetIfNeededSub(reason);
+
+   // Record reset time for duplicate-deal filtering and per-session bookkeeping.
+   lastResetTimeSub = TimeCurrent();
+
+   subActive = false;
+   gongLaiModeSub = false;
+   trailingSLPlacedSub = false;
+
+   trailingGocBuySub = 0.0;
+   trailingGocSellSub = 0.0;
+   lastBuyTrailPriceSub = 0.0;
+   lastSellTrailPriceSub = 0.0;
+   pointABaseLevelSub = 0.0;
+
+   // Clear sub session stats (activation will rebuild)
+   basePriceSub = 0.0;
+   sessionStartTimeSub = 0;
+   sessionStartBalanceSub = 0.0;
+   // keep lastResetTimeSub (used for OnTradeTransaction double-count filtering)
+   sessionClosedProfitSub = 0.0;
+   sessionLockedProfitSub = 0.0;
+   sessionClosedProfitBBSub = 0.0;
+   sessionClosedProfitRemainingSub = 0.0;
+   sessionPeakProfitSub = 0.0;
+   sessionPeakBalanceSub = 0.0;
+   sessionMinBalanceSub = 0.0;
+
+   // Sub balance cooldown reset
+   lastBalanceAAByBBCloseTimeSub = 0;
+   lastBalanceBBCloseTimeSub = 0;
+   ClearBalanceSelectionSub();
+   balancePrepareDirectionSub = 0;
+
+   gongLaiModeSub = false;
+
+   // Chart display disabled: no sub visual zones / base lines.
+
+   // Schedule restart delay (sub only). If delay is scheduled or sub is stopped by other rules,
+   // activation will happen later via TryActivateSubEngine().
+   if(scheduleRestartDelay && ScheduleRestartDelayAfterResetSub(reason))
+      return;
+
+   // If stopped by any gating rule, don't clear ADX/RSI flags here.
+   if(eaStoppedByTargetSub || eaStoppedByScheduleSub || eaStoppedByWeekdaySub || eaStoppedByRestartDelaySub)
+      return;
+
+   // ADX/RSI start gating (when no restart delay was scheduled).
+   if(EnableADXStartFilter && !IsADXStartAllowed())
+   {
+      eaStoppedByAdxSub = true;
+      if(EnableResetNotification || EnableTelegram)
+         SendResetNotification("Sub reset: waiting for ADX start condition");
+      return;
+   }
+   if(EnableRSIStartFilter && !IsRSIStartAllowed())
+   {
+      eaStoppedByRsiSub = true;
+      if(EnableResetNotification || EnableTelegram)
+         SendResetNotification("Sub reset: waiting for RSI cross start condition");
+      return;
+   }
+
+   eaStoppedByAdxSub = false;
+   eaStoppedByRsiSub = false;
 }
 
 //+------------------------------------------------------------------+
@@ -3050,51 +4362,9 @@ void TryResetMode12Sub()
    if(!targetMet)
       return;
 
-   // --- Do reset for SUB only ---
-   CloseAllPositionsAndOrdersSub();
-
-   // Reset sub session stats and base
-   basePriceSub = bidNow;
-   sessionStartTimeSub = TimeCurrent();
-   sessionStartBalanceSub = AccountInfoDouble(ACCOUNT_BALANCE);
-   lastResetTimeSub = TimeCurrent();
-
-   sessionClosedProfitSub = 0.0;
-   sessionLockedProfitSub = 0.0;
-   sessionClosedProfitBBSub = 0.0;
-   sessionClosedProfitRemainingSub = 0.0;
-
-   gongLaiModeSub = false;
-   trailingSLPlacedSub = false;
-   lastBuyTrailPriceSub = 0.0;
-   lastSellTrailPriceSub = 0.0;
-   trailingGocBuySub = 0.0;
-   trailingGocSellSub = 0.0;
-   sessionPeakProfitSub = 0.0;
-   sessionPeakBalanceSub = 0.0;
-   sessionMinBalanceSub = 0.0;
-
-   // clear stop flags for sub; restart delay handled below
-   eaStoppedByTargetSub = false;
-   eaStoppedByScheduleSub = false;
-   scheduleStopPendingSub = false;
-   eaStoppedByWeekdaySub = false;
-   weekdayStopPendingSub = false;
-   eaStoppedByAdxSub = false;
-   eaStoppedByRsiSub = false;
-   eaStoppedByRestartDelaySub = false;
-   restartDelayUntilSub = 0;
-
-   InitializeGridLevelsSubOnly();
-
-   if(ScheduleRestartDelayAfterResetSub("Sub Level match reset"))
-   {
-      // Wait before placing sub grid again
-      return;
-   }
-
-   if(!eaStoppedByRestartDelaySub)
-      ManageGridOrdersSub();
+   // Reset sub independently (daily/trading-hours/weekday + ADX/RSI gating too).
+   DisableSubEngineAndMaybeRestart("Sub Level match reset", true);
+   return;
 }
 
 //+------------------------------------------------------------------+
@@ -3385,7 +4655,7 @@ void DoBalanceAll()
    UpdateBalancePrepareMarks(tickets, openPrices, cnt);
    double levelPrice0 = balanceSelectedLevelPrice;   // use remembered level to close the correct orders
    double tolLevel = gridStep * 0.5;
-   double balanceFloor = sessionStartBalance + lockedProfitReserve;
+   double balanceFloor = sessionStartBalance + lockedProfitReserveMain;
    double balanceNow = AccountInfoDouble(ACCOUNT_BALANCE);
    double runningClosed = sessionClosedProfitRemaining;
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -3433,6 +4703,206 @@ void DoBalanceAll()
       Print("Balance: closed ", closedCount, " (AA+BB+CC, farthest first). Pool remaining ", runningClosed, ".");
    }
    // Next tick DoBalanceAll rebuilds queue
+}
+
+// Sub balance rules for AA_Sub, BB_Sub (independent from MAIN).
+void DoBalanceAllSub()
+{
+   bool anyBalance = (EnableAA && EnableBalanceAAByBB && BALANCE_THRESHOLD_USD_DEFAULT > 0) ||
+                     (EnableBB && EnableBalanceBB && BALANCE_THRESHOLD_USD_DEFAULT > 0) ||
+                     (EnableBalanceOpenAcrossBaseNoTP && BalanceOpenAcrossBaseNoTP_XUSD > 0);
+   if(!anyBalance)
+      return;
+   if(sessionClosedProfitRemainingSub < 0)
+      return;
+
+   int minCooldown = 0;
+   if(EnableAA && EnableBalanceAAByBB && BALANCE_THRESHOLD_USD_DEFAULT > 0 && BALANCE_COOLDOWN_SEC_DEFAULT > 0)
+      minCooldown = (minCooldown == 0) ? BALANCE_COOLDOWN_SEC_DEFAULT : MathMin(minCooldown, BALANCE_COOLDOWN_SEC_DEFAULT);
+   if(EnableBB && EnableBalanceBB && BALANCE_THRESHOLD_USD_DEFAULT > 0 && BALANCE_COOLDOWN_SEC_DEFAULT > 0)
+      minCooldown = (minCooldown == 0) ? BALANCE_COOLDOWN_SEC_DEFAULT : MathMin(minCooldown, BALANCE_COOLDOWN_SEC_DEFAULT);
+   if(EnableBalanceOpenAcrossBaseNoTP && BALANCE_COOLDOWN_SEC_DEFAULT > 0)
+      minCooldown = (minCooldown == 0) ? BALANCE_COOLDOWN_SEC_DEFAULT : MathMin(minCooldown, BALANCE_COOLDOWN_SEC_DEFAULT);
+
+   datetime lastClose = MathMax(lastBalanceAAByBBCloseTimeSub, lastBalanceBBCloseTimeSub);
+   if(minCooldown > 0 && lastClose > 0 && (TimeCurrent() - lastClose) < minCooldown)
+      return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool priceAboveBase = (bid > basePriceSub);
+   bool priceBelowBase = (bid < basePriceSub);
+   if((priceAboveBase || priceBelowBase) && !IsRSIBalanceAllowed(priceAboveBase))
+      return;
+
+   if(EnableBalanceOpenAcrossBaseNoTP && BalanceOpenAcrossBaseNoTP_XUSD > 0)
+   {
+      BalanceOpenAcrossBaseNoTP_Sub(BalanceOpenAcrossBaseNoTP_XUSD);
+      return;
+   }
+
+   int nLevels = ArraySize(gridLevelsSub);
+   int prepLevels = MathMax(1, MathMin(MaxGridLevels, BALANCE_PREPARE_LEVELS));
+   int execLevels = MathMax(prepLevels, MathMin(MaxGridLevels, BALANCE_EXECUTE_LEVELS));
+   int idxPrep = prepLevels - 1;
+   int idxExec = execLevels - 1;
+
+   if(balancePrepareDirectionSub == 1 && !priceAboveBase)
+   {
+      ClearBalanceSelectionSub();
+      balancePrepareDirectionSub = 0;
+   }
+   else if(balancePrepareDirectionSub == -1 && !priceBelowBase)
+   {
+      ClearBalanceSelectionSub();
+      balancePrepareDirectionSub = 0;
+   }
+   if(!priceAboveBase && !priceBelowBase)
+      return;
+
+   if(priceAboveBase)
+   {
+      if(nLevels <= idxPrep || bid < gridLevelsSub[idxPrep])
+         return;
+      if(nLevels <= idxExec || bid < gridLevelsSub[idxExec])
+         balancePrepareDirectionSub = 1;
+   }
+   else if(priceBelowBase)
+   {
+      int idxPrepBelow = MaxGridLevels + idxPrep;
+      if(nLevels <= idxPrepBelow || bid > gridLevelsSub[idxPrepBelow])
+         return;
+      int idxExecBelow = MaxGridLevels + idxExec;
+      if(nLevels <= idxExecBelow || bid > gridLevelsSub[idxExecBelow])
+         balancePrepareDirectionSub = -1;
+   }
+
+   bool executeZone = false;
+   if(priceAboveBase && nLevels > idxExec && bid >= gridLevelsSub[idxExec])
+      executeZone = true;
+   else if(priceBelowBase)
+   {
+      int idxExecBelow = MaxGridLevels + idxExec;
+      if(nLevels > idxExecBelow && bid <= gridLevelsSub[idxExecBelow])
+         executeZone = true;
+   }
+
+   ulong tickets[];
+   double pls[], vols[], openPrices[];
+   int types[]; // 0=AA_Sub, 1=BB_Sub
+   ArrayResize(tickets, 0);
+   ArrayResize(pls, 0);
+   ArrayResize(vols, 0);
+   ArrayResize(openPrices, 0);
+   ArrayResize(types, 0);
+   long magics[] = {MagicAA_Sub, MagicBB_Sub};
+   bool enabled[] = {EnableAA && EnableBalanceAAByBB, EnableBB && EnableBalanceBB};
+   double thresholds[] = {BALANCE_THRESHOLD_USD_DEFAULT, BALANCE_THRESHOLD_USD_DEFAULT};
+   for(int t = 0; t < 2; t++)
+   {
+      if(!enabled[t] || thresholds[t] <= 0) continue;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket <= 0) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != magics[t] || PositionGetString(POSITION_SYMBOL) != _Symbol)
+            continue;
+         if(sessionStartTimeSub > 0 && (datetime)PositionGetInteger(POSITION_TIME) < sessionStartTimeSub)
+            continue;
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double pr = GetPositionPnL(ticket);
+         double vol = PositionGetDouble(POSITION_VOLUME);
+         if(!IsLosingOppositeSidePositionSub(ticket, priceAboveBase)) continue;
+         if(IsPositionLockedForBalanceSub(ticket, priceAboveBase)) continue;
+         int n = ArraySize(tickets);
+         ArrayResize(tickets, n + 1);
+         ArrayResize(pls, n + 1);
+         ArrayResize(vols, n + 1);
+         ArrayResize(openPrices, n + 1);
+         ArrayResize(types, n + 1);
+         tickets[n] = ticket;
+         pls[n] = pr;
+         vols[n] = vol;
+         openPrices[n] = openPrice;
+         types[n] = t;
+      }
+   }
+   int cnt = ArraySize(tickets);
+   if(cnt == 0) return;
+
+   for(int i = 0; i < cnt - 1; i++)
+      for(int j = i + 1; j < cnt; j++)
+      {
+         double di = MathAbs(openPrices[i] - basePriceSub);
+         double dj = MathAbs(openPrices[j] - basePriceSub);
+         bool swap = (dj > di);
+         if(!swap && MathAbs(dj - di) < gridStep * 0.5 && types[j] < types[i])
+            swap = true; // AA_Sub then BB_Sub
+         if(swap)
+         {
+            SwapDouble(openPrices[i], openPrices[j]);
+            SwapDouble(pls[i], pls[j]);
+            SwapDouble(vols[i], vols[j]);
+            SwapULong(tickets[i], tickets[j]);
+            int tt = types[i]; types[i] = types[j]; types[j] = tt;
+         }
+      }
+
+   if(!executeZone)
+   {
+      if(balancePrepareDirectionSub == 0)
+         balancePrepareDirectionSub = priceAboveBase ? 1 : -1;
+      UpdateBalancePrepareMarksSub(tickets, openPrices, cnt);
+      return;
+   }
+
+   UpdateBalancePrepareMarksSub(tickets, openPrices, cnt);
+   double levelPrice0 = balanceSelectedLevelPriceSub;
+   double tolLevel = gridStep * 0.5;
+   double balanceFloor = sessionStartBalanceSub + lockedProfitReserveSub;
+   double balanceNow = AccountInfoDouble(ACCOUNT_BALANCE);
+   double runningClosed = sessionClosedProfitRemainingSub;
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   int closedCount = 0;
+   for(int k = 0; k < cnt; k++)
+   {
+      if(MathAbs(openPrices[k] - levelPrice0) > tolLevel)
+         break;
+      int typ = types[k];
+      double thresh = thresholds[typ];
+      double afterClose = runningClosed + pls[k];
+      double balanceAfterClose = balanceNow + pls[k];
+      if(afterClose >= thresh && afterClose >= 0 && balanceAfterClose >= balanceFloor)
+      {
+         PositionCloseWithComment(tickets[k], "Sub Balance order");
+         runningClosed += pls[k];
+         balanceNow = balanceAfterClose;
+         closedCount++;
+         if(typ == 0) lastBalanceAAByBBCloseTimeSub = TimeCurrent();
+         else lastBalanceBBCloseTimeSub = TimeCurrent();
+         continue;
+      }
+      double spendable = MathMin(runningClosed, MathMin(balanceNow - balanceFloor, MathAbs(pls[k])));
+      if(spendable <= 0) continue;
+      double volClose = vols[k] * (spendable / MathAbs(pls[k]));
+      volClose = MathFloor(volClose / lotStep) * lotStep;
+      if(volClose < minLot) continue;
+      if(volClose >= vols[k]) volClose = vols[k];
+      if(PositionClosePartialWithComment(tickets[k], volClose, "Sub Balance order"))
+      {
+         double realizedPnL = (volClose / vols[k]) * pls[k];
+         runningClosed += realizedPnL;
+         balanceNow += realizedPnL;
+         closedCount++;
+         if(typ == 0) lastBalanceAAByBBCloseTimeSub = TimeCurrent();
+         else lastBalanceBBCloseTimeSub = TimeCurrent();
+      }
+   }
+   if(closedCount > 0)
+   {
+      sessionClosedProfitRemainingSub = runningClosed;
+      Print("Sub Balance: closed ", closedCount, " (AA+BB, farthest first). Pool remaining ", runningClosed, ".");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -3803,7 +5273,7 @@ void PlacePendingOrder(ENUM_ORDER_TYPE orderType, double priceLevel, int levelNu
 void PlacePendingOrderAA_Sub(ENUM_ORDER_TYPE orderType, double priceLevel, int levelNum)
 {
    double price = NormalizeDouble(priceLevel, dgt);
-   double lot   = GetLotForLevel(orderType, levelNum);
+   double lot   = GetLotForLevelSub(orderType, levelNum);
    double tp = 0;
    double tpPips = GetTakeProfitPipsForOrderType(orderType);
    if(tpPips > 0)
@@ -3843,7 +5313,7 @@ void PlacePendingOrderBB(bool isBuyStop, double priceLevel, int levelNum)
 void PlacePendingOrderBB_Sub(bool isBuyStop, double priceLevel, int levelNum)
 {
    double price = NormalizeDouble(priceLevel, dgt);
-   double lot   = GetLotForLevelBB(isBuyStop, levelNum);
+   double lot   = GetLotForLevelBBSub(isBuyStop, levelNum);
    double tp = 0;
    double tpPips = GetTakeProfitPipsBB();
    if(tpPips > 0)
