@@ -84,12 +84,15 @@ Các hàm Sub riêng:
 - `WeekdayStopOnResetIfNeededSub()`
 
 ### 4.6 Balance
-- Main giữ `DoBalanceAll()` như cũ.
-- Sub có balance riêng cho chế độ open/noTP across base:
-  - `BalanceOpenAcrossBaseNoTP_Sub()`
-  - dùng pool/cooldown riêng của Sub (`sessionClosedProfitRemainingSub`, `lastBalance...Sub`)
+- Main: `DoBalanceAll()` (AA/BB/CC + open/noTP across base).
+- Sub: `DoBalanceAllSub()` (AA/BB + open/noTP across base), chạy độc lập với state riêng.
+- Sub dùng pool/cooldown/selection/floor riêng:
+  - `sessionClosedProfitRemainingSub`
+  - `lastBalanceAAByBBCloseTimeSub`, `lastBalanceBBCloseTimeSub`
+  - `balancePrepareDirectionSub`, `balanceSelectedLevelPriceSub`, `balanceSelectedTicketsSub`
+  - `lockedProfitReserveSub`
 
-> Luu y: Sub chỉ có AA/BB, nên không có CC/DD trong balance của Sub.
+> Lưu ý: Sub chỉ có AA/BB nên không có nhánh CC/DD trong balance Sub.
 
 ### 4.7 Virtual pending / re-arm
 - Main clear/đóng theo magic Main.
